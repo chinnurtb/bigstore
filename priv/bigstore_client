@@ -1,0 +1,368 @@
+#!/usr/bin/env escript
+
+-mode(compile).
+
+-define(CHUNK_SIZE,     1024 * 16).
+-define(GET_CHUNK_SIZE, 1024 * 1024 * 16).
+
+-define(RPC_TIMEOUT,  timer:seconds(10)).
+-define(CONN_TIMEOUT, timer:seconds(4)).
+-define(SEND_TIMEOUT, timer:seconds(20)).
+-define(RECV_TIMEOUT, timer:seconds(20)).
+
+-define(REQ_GET_BLOB,   0).
+-define(REQ_PUT_BLOB,   1).
+-define(REQ_WRITE_BLOB, 2).
+
+-define(RES_OK,                0).
+-define(RES_ERROR_TIMEOUT,     1).
+-define(RES_ERROR_REPLICATION, 2).
+-define(RES_ERROR_OLD_BLOB,    3).
+-define(RES_ERROR_TEMP_EXISTS, 4).
+
+-record(get, {fd, sockets, next_chunks, chunks}).
+
+main(["--get", Node, Key]) ->
+    start_node(),
+    case query_node(Node, has_blob, [Key]) of
+        {ok, Size, Hash, Nodes} ->
+            case connect_nodes(Nodes) of
+                [] ->
+                    io:format(standard_error, "Error: can't contact any node~n", []),
+                    halt(1);
+                SocketsPartitions ->
+                    get_blob(SocketsPartitions, Key, Size, Hash)
+            end;
+        {error, none} ->
+            io:format(standard_error, "Error: BLOB doesn't exist in any node~n", []),
+            halt(1)
+    end;
+main(["--put", Node, Key, File]) ->
+    start_node(),
+    {Host, Port, Partition} = query_node(Node, key_data_host_port, [Key]),
+    Socket = connect_node(Host, Port, Partition),
+    put_blob(Socket, Partition, Key, File),
+    recv_result(Socket);
+main(_) ->
+    Arg0 = escript:script_name(),
+    io:format(standard_error, "Usage: ~s --get <node> <key>~n"
+                              "       ~s --put <node> <key> <file>~n"
+                              "       ~s --del <node> <key>~n", [Arg0, Arg0, Arg0]),
+    halt(1).
+
+%%% ---------------------------------------------------------------------------
+%%% Connection
+%%% ---------------------------------------------------------------------------
+
+start_node() ->
+    {_, _, X0} = now(),
+    X = integer_to_list(X0),
+    Host = net_adm:localhost(),
+    Node = list_to_atom("bigstore_client_" ++ X ++ "@" ++ Host),
+    net_kernel:start([Node]),
+    erlang:set_cookie(node(), bigstore).
+
+query_node(SomeNode, Req, Args) ->
+    io:format("Querying node ~s", [SomeNode]),
+    case
+        rpc:call(list_to_atom("bigstore@" ++ SomeNode), bigstore,
+                 Req, Args, ?RPC_TIMEOUT)
+    of
+        {badrpc, _Reason} ->
+            io:format(standard_error, " failed~n", []),
+            io:format(standard_error, "Error: can't query node ~s~n", [SomeNode]),
+            halt(1);
+        Res ->
+            io:format(" OK~n"),
+            Res
+    end.
+
+connect_nodes(Nodes) ->
+    lists:reverse(connect_nodes(Nodes, [])).
+
+connect_nodes([], SocketsPartitions) ->
+    SocketsPartitions;
+connect_nodes([{Host, Port, Partition} | Rest], SocketsPartitions) ->
+    io:format("Connecting to node ~s:~b ring-id:~b", [Host, Port, Partition]),
+    case
+        gen_tcp:connect(Host, Port, [binary, {active, false}, {keepalive, true},
+                                     {recbuf, ?CHUNK_SIZE}, {sndbuf, ?CHUNK_SIZE},
+                                     {send_timeout, ?SEND_TIMEOUT}, {send_timeout_close, true}],
+                        ?CONN_TIMEOUT)
+    of
+        {ok, Socket} ->
+            io:format(" OK~n"),
+            connect_nodes(Rest, [{Socket, Partition} | SocketsPartitions]);
+        {error, _Reason} ->
+            io:format(standard_error, " failed~n", []),
+            connect_nodes(Rest, SocketsPartitions)
+    end.
+
+connect_node(Host, Port, Partition) ->
+    io:format("Connecting to node ~s:~b ring-id:~b", [Host, Port, Partition]),
+    case
+        gen_tcp:connect(Host, Port, [binary, {active, false}, {keepalive, true},
+                                     {recbuf, ?CHUNK_SIZE}, {sndbuf, ?CHUNK_SIZE},
+                                     {send_timeout, ?SEND_TIMEOUT}, {send_timeout_close, true}],
+                        ?CONN_TIMEOUT)
+    of
+        {ok, Socket} ->
+            io:format(" OK~n"),
+            Socket;
+        {error, _Reason} ->
+            io:format(standard_error, " failed~n", []),
+            io:format(standard_error, "Error: can't contact node ~s:~b~n", [Host, Port]),
+            halt(1)
+    end.
+
+recv_result(Socket) ->
+    receive
+        {tcp, Socket, <<?RES_OK>>} ->
+            gen_tcp:close(Socket),
+            io:format("~nOperation completed~n");
+        {tcp, Socket, <<?RES_ERROR_TIMEOUT>>} ->
+            io:format(standard_error, "~nError: connection timeout~n", []),
+            halt(1);
+        {tcp, Socket, <<?RES_ERROR_REPLICATION>>} ->
+            io:format(standard_error, "~nError: replica node failed~n", []),
+            halt(1);
+        {tcp, Socket, <<?RES_ERROR_OLD_BLOB>>} ->
+            io:format(standard_error, "~nError: BLOB couldn't be inserted because there "
+                      "was already one with same key and newer timestamp~n", []),
+            halt(1);
+        {tcp, Socket, <<?RES_ERROR_TEMP_EXISTS>>} ->
+            io:format(standard_error, "~nError: BLOB couldn't be inserted because there "
+                      "was already one with same key been transferred~n", []),
+            halt(1);
+        {What, Socket} when What == tcp_closed; What == tcp_error ->
+            io:format(standard_error, "~nError: connection closed~n", []),
+            halt(1)
+    after
+        ?RECV_TIMEOUT ->
+            io:format(standard_error, "~nError: connection timeout~n", []),
+            halt(1)
+    end.
+
+%%% ---------------------------------------------------------------------------
+%%% Get
+%%% ---------------------------------------------------------------------------
+
+get_blob(SocketsPartitions, Key, Size, Hash) ->
+    get_blob(SocketsPartitions, Key, Size, Hash, []).
+
+get_blob([], _Key, _Size, _Hash, []) ->
+    io:format(standard_error, "Error: can't contact any node~n", []),
+    halt(1);
+get_blob([], Key, Size, _Hash, Sockets) ->
+    Fd = create_empty_file(Key, Size),
+    init_status(Size),
+    update_status(0),
+    recv_parallel_loop(#get{fd = Fd, sockets = Sockets, chunks = [],
+                            next_chunks = create_chunk_ranges(Size)});
+get_blob([{Socket, Partition} | Rest], Key, Size, Hash, Sockets) ->
+    case get_blob_connect(Socket, Partition, Key, Size, Hash) of
+        {ok, Socket} ->
+            get_blob(Rest, Key, Size, Hash, [Socket | Sockets]);
+        {error, _Reason} ->
+            get_blob(Rest, Key, Size, Hash, Sockets)
+    end.
+
+get_blob_connect(Socket, Partition0, Key0, Size, Hash) ->
+    Partition = list_to_binary(integer_to_list(Partition0)),
+    PartLen = byte_size(Partition),
+    Key = list_to_binary(Key0),
+    Len = byte_size(Key),
+    try
+        ok = gen_tcp:send(Socket, <<?REQ_GET_BLOB, PartLen:64, Partition/binary,
+                                    Len:64, Key/binary, Size:64>>),
+        ok = gen_tcp:send(Socket, Hash),
+        inet:setopts(Socket, [{active, once}]),
+        {ok, Socket}
+    catch
+        throw:{badmatch, {error, Reason}} ->
+            io:format(standard_error, "Warning: BLOB hash mismatch in partition ~b~n",
+                      [Partition0]),
+            {error, Reason}
+    end.
+
+create_empty_file(File, Size) ->
+    case file:open(File, [write, raw]) of
+        {ok, Fd} ->
+            ok = file:advise(Fd, 0, Size, dont_need),
+            Fd;
+        {error, _Reason} ->
+            io:format(standard_error, "Error: can't create file ~s~n", [File]),
+            halt(1)
+    end.
+
+recv_parallel_loop(#get{sockets = []}) ->
+    io:format(standard_error, "~nError: connection closed by all nodes~n", []),
+    halt(1);
+recv_parallel_loop(Get = #get{next_chunks = [], chunks = []}) ->
+    lists:foreach(fun(S) -> ok = gen_tcp:close(S) end, Get#get.sockets),
+    ok = file:close(Get#get.fd),
+    io:format("~nOperation completed~n");
+recv_parallel_loop(Get0) ->
+    Get = assign_chunks(Get0),
+    receive
+        {tcp, Socket, Data} ->
+            inet:setopts(Socket, [{active, once}]),
+            update_status(byte_size(Data)),
+            case add_data(Get, Socket, Data) of
+                {chunk_completed, Chunk, Get2} ->
+                    write_chunk(Get2, Chunk),
+                    recv_parallel_loop(Get2);
+                Get2 ->
+                    recv_parallel_loop(Get2)
+            end;
+        {What, Socket} when What == tcp_closed; What == tcp_error ->
+            clear_line(),
+            io:format(standard_error, "Warning: connection closed by a node~n", []),
+            Get2 = remove_socket(Get, Socket),
+            recv_parallel_loop(Get2)
+    after
+        ?RECV_TIMEOUT ->
+            clear_line(),
+            io:format(standard_error, "Warning: removing stalled connection~n", []),
+            Get2 = remove_last_socket(Get),
+            recv_parallel_loop(Get2)
+    end.
+
+%%% ---------------------------------------------------------------------------
+%%% Chunks
+%%% ---------------------------------------------------------------------------
+
+assign_chunks(Get = #get{next_chunks = []}) ->
+    Get;
+assign_chunks(Get = #get{next_chunks = NextChunks, chunks = Chunks}) ->
+    case free_sockets(Get) of
+        [] ->
+            Get;
+        [FreeSocket | _] ->
+            [Chunk0 | NextChunks2] = NextChunks,
+            Chunk = {FreeSocket, Chunk0, 0, []},
+            request_chunk(FreeSocket, Chunk0),
+            assign_chunks(Get#get{next_chunks = NextChunks2, chunks = [Chunk | Chunks]})
+    end.
+
+remove_socket(Get, Socket) ->
+    Sockets2 = lists:delete(Socket, Get#get.sockets),
+    case lists:keytake(Socket, 1, Get#get.chunks) of
+        {value, {Socket, Chunk, _Size, _Data}, Chunks2} ->
+            NextChunks = [Chunk | Get#get.next_chunks],
+            Get#get{sockets = Sockets2, next_chunks = NextChunks, chunks = Chunks2};
+        false ->
+            Get#get{sockets = Sockets2}
+    end.
+
+remove_last_socket(Get) ->
+    LastSocket = element(1, lists:last(Get#get.chunks)),
+    remove_socket(Get, LastSocket).
+
+free_sockets(Get) ->
+    ChunkSockets = lists:map(fun({S, _, _, _}) -> S end, Get#get.chunks),
+    Get#get.sockets -- ChunkSockets.
+
+request_chunk(Socket, {Offset, Len}) ->
+    gen_tcp:send(Socket, <<Offset:64, Len:64>>).
+
+add_data(Get, Socket, Data) ->
+    BS = byte_size(Data),
+    case lists:keytake(Socket, 1, Get#get.chunks) of
+        {value, {Socket, {Offset, Len}, Size, OldData}, Chunks} when Len == Size + BS ->
+            NewData = lists:reverse([Data | OldData]),
+            Chunk = {Socket, {Offset, Len}, Len, NewData},
+            {chunk_completed, Chunk, Get#get{chunks = Chunks}};
+        {value, {Socket, {Offset, Len}, Size, OldData}, Chunks} ->
+            Size2 = Size + BS,
+            NewData = [Data | OldData],
+            Chunk = {Socket, {Offset, Len}, Size2, NewData},
+            Get#get{chunks = [Chunk | Chunks]}
+    end.
+
+write_chunk(Get, {_Socket, {Offset, Len}, Len, Data}) ->
+    ok = file:pwrite(Get#get.fd, Offset, Data).
+
+create_chunk_ranges(Size) ->
+    create_chunk_ranges(0, Size).
+
+create_chunk_ranges(_Offset, 0) ->
+    [];
+create_chunk_ranges(Offset, Len) when Len > ?GET_CHUNK_SIZE ->
+    Offset2 = Offset + ?GET_CHUNK_SIZE,
+    Len2 = Len - ?GET_CHUNK_SIZE,
+    [{Offset, ?GET_CHUNK_SIZE} | create_chunk_ranges(Offset2, Len2)];
+create_chunk_ranges(Offset, Len) ->
+    [{Offset, Len}].
+
+%%% ---------------------------------------------------------------------------
+%%% Put
+%%% ---------------------------------------------------------------------------
+
+put_blob(Socket, Partition0, Key0, File) when is_list(File) ->
+    case file:open(File, [read, raw, binary]) of
+        {ok, Fd} ->
+            Partition = list_to_binary(integer_to_list(Partition0)),
+            PartLen = byte_size(Partition),
+            Key = list_to_binary(Key0),
+            Len = byte_size(Key),
+            Size = filelib:file_size(File),
+            ok = file:advise(Fd, 0, Size, sequential),
+            inet:setopts(Socket, [{active, true}]),
+            init_status(Size),
+            update_status(0),
+            case
+                gen_tcp:send(Socket, <<?REQ_PUT_BLOB, PartLen:64, Partition/binary,
+                                       Len:64, Key/binary, Size:64>>)
+            of
+                ok ->
+                    put_blob(Socket, Partition0, Key, Fd);
+                {error, _Reason} ->
+                    recv_result(Socket)
+            end;
+        {error, _Reason} ->
+            gen_tcp:close(Socket),
+            io:format(standard_error, "Error: can't open file ~s~n", [File]),
+            halt(1)
+    end;
+put_blob(Socket, Partition, Key, Fd) ->
+    case file:read(Fd, ?CHUNK_SIZE) of
+        {ok, Data} ->
+            case gen_tcp:send(Socket, Data) of
+                ok ->
+                    update_status(byte_size(Data)),
+                    put_blob(Socket, Partition, Key, Fd);
+                {error, _Reason} ->
+                    recv_result(Socket)
+            end;
+        eof ->
+            ok
+    end.
+
+%%% ---------------------------------------------------------------------------
+%%% Status
+%%% ---------------------------------------------------------------------------
+
+init_status(TotalSize) ->
+    put(status_last_size, 0),
+    put(status_current_size, 0),
+    put(status_total_size, TotalSize).
+
+update_status(DataSize) ->
+    Last = get(status_last_size),
+    Current = get(status_current_size) + DataSize,
+    Total = get(status_total_size),
+    put(status_current_size, Current),
+    case {Current - Last > 10 * 1024 * 1024, Current == Total} of
+        {A, B} when A; B ->
+            put(status_last_size, Current),
+            Percent = min(round(Current / Total * 100), 100),
+            BarLen = round(Current / Total * 20),
+            Bar = lists:duplicate(BarLen, $=) ++ lists:duplicate(20 - BarLen, $ ),
+            clear_line(),
+            io:format("~3b% [~s]", [Percent, Bar]);
+        _ ->
+            ok
+    end.
+
+clear_line() -> io:format("\e[2K\e[1G").

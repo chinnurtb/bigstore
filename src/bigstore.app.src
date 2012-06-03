@@ -1,0 +1,23 @@
+{application, bigstore,
+ [
+  {description, "Data store for large blobs"},
+  {vsn, "0.1"},
+  {registered, [
+                bigstore_sup,
+                bigstore_vnode_master,
+                bigstore_tcpd
+               ]},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  crypto,
+                  sasl,
+                  riak_core
+                 ]},
+  {mod, {bigstore_app, []}},
+  {env, [
+         {replica_size,   3},
+         {data_acceptors, 10},
+         {data_port,      9000}
+        ]}
+ ]}.
