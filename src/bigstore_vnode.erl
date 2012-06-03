@@ -45,11 +45,25 @@ handle_command(get_data_host_port, _Sender, State) ->
     {reply, data_server_info(State), State};
 handle_command({has_blob, Ref, From, Key}, _Sender, State) ->
     case dets:lookup(State#state.partition, Key) of
+        [{Key, Time, deleted}] ->
+            From ! {deleted, Ref, data_server_info(State), Time};
         [{Key, Time, Hash}] ->
             Size = filelib:file_size(blob_path(State, Key)),
             From ! {true, Ref, data_server_info(State), Size, Time, Hash};
         [] ->
             From ! {false, Ref, data_server_info(State)}
+    end,
+    {noreply, State};
+handle_command({delete_blob, Ref, From, Key, Time}, _Sender, State) ->
+    case insert_blob_index(State#state.partition, Key, Time, deleted) of
+        ok ->
+            file:delete(blob_path(State, Key)),
+            os:cmd("sync"),
+            From ! {ok, Ref};
+        {error, already_deleted} ->
+            From ! {ok, Ref};
+        {error, old_blob} ->
+            From ! {error, Ref, old_blob}
     end,
     {noreply, State}.
 
@@ -69,6 +83,7 @@ delete(State) ->
     ok = file:del_dir(blobs_path(State)),
     ok = file:delete(index_path(State)),
     ok = file:del_dir(filename:dirname(index_path(State))),
+    os:cmd("sync"),
     {ok, State}.
 
 handoff_starting(_TargetNode, State) ->
@@ -155,13 +170,17 @@ exec_blob_cmd(State = #state{handoff_blob = {Blob, Fd}}, Blob, {close, Time, Has
     ok = file:close(Fd),
     case insert_blob_index(State, Time, Hash) of
         ok ->
-            ok = file:rename(blob_temp_path(State, Blob), blob_path(State, Blob));
+            ok = file:rename(blob_temp_path(State, Blob), blob_path(State, Blob)),
+            os:cmd("sync");
         {error, old_blob} ->
             ok = file:delete(blob_temp_path(State, Blob))
     end,
     State#state{handoff_blob = undefined}.
 
-insert_blob_index(State = #state{partition = Partition, handoff_blob = {Blob, _}}, Time, Hash) ->
+insert_blob_index(#state{partition = Partition, handoff_blob = {Blob, _}}, Time, Hash) ->
+    insert_blob_index(Partition, Blob, Time, Hash).
+
+insert_blob_index(Partition, Blob, Time, Hash) ->
     case dets:insert_new(Partition, {Blob, Time, Hash}) of
         true ->
             dets:sync(Partition),
@@ -169,14 +188,13 @@ insert_blob_index(State = #state{partition = Partition, handoff_blob = {Blob, _}
         false ->
             case dets:lookup(Partition, Blob) of
                 [] ->
-                    insert_blob_index(State, Time, Hash);
-                [Obj = {_, Time2, _}] ->
-                    case Time > Time2 of
-                        true ->
-                            ok = dets:delete_object(Partition, Obj),
-                            insert_blob_index(State, Time, Hash);
-                        false ->
-                            {error, old_blob}
-                    end
+                    insert_blob_index(Partition, Blob, Time, Hash);
+                [{Blob, Time2, deleted}] when Hash == deleted, Time >= Time2 ->
+                    {error, already_deleted};
+                [Obj = {Blob, Time2, _}] when Time > Time2 ->
+                    ok = dets:delete_object(Partition, Obj),
+                    insert_blob_index(Partition, Blob, Time, Hash);
+                _ ->
+                    {error, old_blob}
             end
     end.

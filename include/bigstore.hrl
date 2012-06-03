@@ -1,5 +1,6 @@
 -define(DEBUG, true).
 
+-define(RPC_TIMEOUT,  timer:seconds(5)).
 -define(CONN_TIMEOUT, timer:seconds(4)).
 -define(SEND_TIMEOUT, timer:seconds(20)).
 -define(RECV_TIMEOUT, timer:seconds(20)).

@@ -175,6 +175,7 @@ handle_info({tcp, Socket, Data}, write_blob, State = #state{socket = Socket}) ->
             case insert_blob_index(State2) of
                 ok ->
                     ok = file:rename(blob_temp_path(State2, State2#state.blob), blob_path(State2, State2#state.blob)),
+                    os:cmd("sync"),
                     {stop, normal, State2#state{size = 0, fd = undefined}};
                 {error, old_blob} ->
                     {stop, old_blob, State2#state{size = 0, fd = undefined}}

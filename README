@@ -164,6 +164,6 @@ ha sido satisfactoria:
 
 	$ priv/bigstore_client --put node1.local "foobar" /tmp/blob
 	Querying node node1.local OK
-	Connecting to node node1.local:8001 ring-id:1427247692705959881058285969449495136382746624000 OK
+	Connecting to node node1.local:8001 ring-id:14272476927059000 OK
 	100% [====================]
 	Operation completed

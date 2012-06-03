@@ -43,11 +43,23 @@ main(["--put", Node, Key, File]) ->
     Socket = connect_node(Host, Port, Partition),
     put_blob(Socket, Partition, Key, File),
     recv_result(Socket);
+main(["--del", Node, Key]) ->
+    start_node(),
+    case query_node(Node, delete_blob, [Key]) of
+        {ok, all} ->
+            io:format("All the replicas confirmed the removal of the BLOB~n");
+        {ok, N} ->
+            io:format("Only ~b replicas confirmed the removal of the BLOB~n", [N]);
+        {error, old_blob} ->
+            io:format(standard_error, "Error: BLOB couldn't be deleted because there "
+                      "was already one with same key and newer timestamp~n", [])
+    end,
+    io:format("Operation completed~n");
 main(_) ->
     Arg0 = escript:script_name(),
-    io:format(standard_error, "Usage: ~s --get <node> <key>~n"
-                              "       ~s --put <node> <key> <file>~n"
-                              "       ~s --del <node> <key>~n", [Arg0, Arg0, Arg0]),
+    io:format(standard_error, ("Usage: ~s --get <node> <key>~n"
+                               "       ~s --put <node> <key> <file>~n"
+                               "       ~s --del <node> <key>~n"), [Arg0, Arg0, Arg0]),
     halt(1).
 
 %%% ---------------------------------------------------------------------------
@@ -174,8 +186,7 @@ get_blob_connect(Socket, Partition0, Key0, Size, Hash) ->
     Len = byte_size(Key),
     try
         ok = gen_tcp:send(Socket, <<?REQ_GET_BLOB, PartLen:64, Partition/binary,
-                                    Len:64, Key/binary, Size:64>>),
-        ok = gen_tcp:send(Socket, Hash),
+                                    Len:64, Key/binary, Size:64, Hash/binary>>),
         inet:setopts(Socket, [{active, once}]),
         {ok, Socket}
     catch
