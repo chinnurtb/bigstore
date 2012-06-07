@@ -1,0 +1,169 @@
+  Bigstore
+============
+
+Este repositorio contiene el proyecto para Sistemas Informáticos en el
+que se ha desarrollado un sistema distribuido de almacenamiento de BLOBs
+de gran tamaño.
+
+
+ Configuración
+---------------
+
+Antes de empezar a compilar el proyecto hay que ajustar unos detalles en
+la configuración de cada nodo. El fichero en cuestión que hay que
+modificar es rel/vars.config.
+
+La línea de este fichero que nos permite ajustar el nombre del nodo es:
+
+	{node, "bigstore@127.0.0.1"}.
+
+Debemos reemplazar esa IP local por un hostname válido que permita
+localizar al nodo en la red o en su defecto por su IP pública. La parte
+de "bigstore@" hay que dejarla intacta.
+
+Para ajustar el número de réplicas deseado, basta con modificar la
+siguiente línea, el valor de 3 es el que se toma por defecto:
+
+	{replica_size, "3"}.
+
+Este software necesita los siguientes puertos TCP libres para poder
+funcionar correctamente:
+
+- 4369: para el mapper de puertos entre máquinas virtuales de Erlang.
+- 8000: para la gestión de nodos en el cluster.
+- 8001: para el intercambio de información de BLOBs.
+- 9000-9010: rango de puertos usado para la comunicación nativa de
+             Erlang mediante paso de mensajes.
+
+
+ Instalación
+-------------
+
+El proyecto ha sido probado tanto en Linux como en Mac OS X. El único
+requisito para poder ejecutarlo es tener instalada la última versión de
+Erlang, la versión R15B01.
+
+Para compilar el proyecto basta con ejecutar estos dos comandos:
+
+	$ make
+	$ make rel
+
+El segundo comando nos genera un target release de Erlang en el
+directorio rel/bigstore/. Esto quiere decir que ese directorio lo
+podemos copiar en cualquier lugar y llevará dentro una versión
+autocontenida del runtime de Erlang junto con el código compilado de
+este proyecto. De tal manera que ese directorio es todo lo que hace
+falta para poder ejecutar el sistema.
+
+
+ Ejecución
+-----------
+
+El proyecto se controla con dos scripts que permiten arrancar y parar el
+servidor a la vez que gestionar el cluster de nodos. Estos scripts son
+rel/bigstore/bin/bigstore y rel/bigstore/bin/bigstore-admin.
+
+El primero nos permite arrancar y para el sistema en un nodo:
+
+	Usage: bigstore {start|stop|restart|reboot|ping|
+			 console|console_clean|attach}
+
+Por tanto para arrancar y parar el sistema en un nodo bastaría ejecutar:
+
+	$ rel/bigstore/bin/bigstore start
+	$ rel/bigstore/bin/bigstore stop
+
+Con el siguiente comando podemos saber si el servidor de un nodo está
+correctamente arrancado:
+
+	$ rel/bigstore/bin/bigstore ping
+
+El segundo script nos permite insertar y extraer nodos de un cluster:
+
+	Usage: bigstore-admin { join | leave | reip | ringready |
+				remove | services | wait-for-service |
+				member_status | ring_status }
+
+Para crear un cluster basta con hacer que dos nodos se conecten. Esto lo
+haríamos teniendo dos nodos ejecutando el servidor y se ejecutaría en
+uno de ellos el siguiente comando:
+
+	$ rel/bigstore/bin/bigstore-admin join <node>
+
+Donde <node> es el nombre del otro nodo con el que nos queremos
+conectar, siendo este el nombre que se puso al principio del todo al
+configurar el nodo. Una vez realizada esta operación ya tenemos un
+cluster de dos nodos ejecutando.
+
+Para añadir más nodos, debemos hacerlo de uno en uno y siempre
+ejecutando el comando anterior de join desde el nodo que deseamos que se
+añada al cluster, no desde uno de los nodos del cluster.
+
+Para extraer un nodo del cluster basta con ejecutar:
+
+	$ rel/bigstore/bin/bigstore-admin leave
+
+Hay que tener en cuenta que tanto la operación de join como leave son
+costosas en tiempo si se tienen almacenados muchos BLOBs en el sistema,
+puesto que esto implica que los nodos empezará a distribuir el
+almacenamiento de los mismos de un modo uniforme automáticamente entre
+todos los nodos del cluster.
+
+Un nodo que se une a un cluster tardará en recibir los BLOBs de los que
+se va a hacer cargo, pero los va recibiendo de un modo progresivo y poco
+a poco ya puede ir empezando a funcionar recibiendo/enviando los BLOBs
+que gestiona.
+
+Un nodo que deja el cluster, tardará un rato en terminar de entregar sus
+BLOBs a los nodos del cluster para asegurarse que no se pierde ninguna
+réplica. Por tanto, después de ejecutar el comando de leave, hay que
+esperar que el nodo en cuestión termine de entregar sus BLOBs y el
+automáticamente se parará. Para comprobar si todavía está funcionando el
+nodo y así poder ver cuando se ha parado, podemos usar el comando ping
+anterior mente descrito.
+
+El siguiente comando es muy útil y sirve para ver cuales son los nodos
+que componen un cluster operativo:
+
+	$ rel/bigstore/bin/bigstore-admin member_status
+
+Ambos scripts aquí descritos, se deben ejecutar en la misma máquina en
+la que tenemos corriendo el servidor de un nodo y al que queremos
+gestionar.
+
+
+ Cliente
+---------
+
+El cliente de línea de comandos desarrollado también está escrito en
+Erlang, así que igualmente hace falta tener instalada la versión R15B01
+en la máquina donde se vaya a ejecutar. En este caso no hace falta
+compilar nada ya que el programa se ejecuta como un script. Como es
+lógico, el cliente se puede ejecutar en una máquina que no esté
+corriendo ningún nodo del cluster.
+
+El cliente es el fichero ejecutable priv/bigstore_client:
+
+	Usage: bigstore_client --get <node> <key>
+	       bigstore_client --put <node> <key> <file>
+	       bigstore_client --del <node> <key>
+
+Para usarlo basta con especificar la operación que se desea llevar a
+cabo, un nodo cualquiera del cluster, la clave asociado al BLOB de
+interés y si es necesario, un nombre de fichero donde guardar el BLOB.
+
+Tal y como se explicó en la memoria del proyecto, el cliente puede
+contactar con cualquier nodo del cluster para realizar las operaciones
+de GET, PUT y DELETE. El nodo con el que se contacta se encarga de
+localizar para el cliente los nodos a los que tiene que contactar para
+acceder a los BLOBs de su interés.
+
+Al ejecutar el cliente, se muestra una barra de progreso indicando
+cuantos datos del BLOB se han transferido y finalmente si la operación
+ha sido satisfactoria:
+
+	$ priv/bigstore_client --put node1.local "foobar" /tmp/blob
+	Querying node node1.local OK
+	Connecting to node node1.local:8001 ring-id:1427247692705959881058285969449495136382746624000 OK
+	100% [====================]
+	Operation completed
